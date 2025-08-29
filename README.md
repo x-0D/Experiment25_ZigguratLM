@@ -86,4 +86,4 @@ The improvement in the model's understanding is reflected in its output.
 
 -   **Epoch 1 Generation:** `The meaning of life is eff find thatgo to its wh Thusailed his world liked on1. I mysteries...` - This is incoherent babble.
 
--   **Epoch 3 Generation:** `The meaning of life is a god chiselled in cloud and clearly standing neutralisation, which we know of beings outside the unformed metal suppressed-five...` - This text is grammatically correct, stylistically consistent with Lovecraft's writing, and thematically appropriate. The model has clearly learned the structure and "feel" of its training data (which consisted only of H.P. Lovecraft's works).
+-   **Epoch 3 Generation:** `The meaning of life is a god chiselled in cloud and clearly standing neutralisation, which we know of beings outside the unformed metal suppressed-five...` - This text is grammatically correct, stylistically consistent with Lovecraft's writing, and thematically appropriate. The model has clearly learned the structure and "feel" of its training data.
