@@ -157,13 +157,21 @@ class DiscretizedManifoldTransformer(nn.Module):
         total_layers = self.config.n_stages * self.config.n_layer_per_stage
         if isinstance(module, SimplifiedRetention): torch.nn.init.normal_(module.out_proj.weight, mean=0.0, std=0.02/math.sqrt(2*total_layers))
         if hasattr(module, 'mlp') and isinstance(module.mlp[-2], nn.Linear): torch.nn.init.normal_(module.mlp[-2].weight, mean=0.0, std=0.02/math.sqrt(2*total_layers))
-    def forward(self, idx, targets=None, return_indices=False):
-        # Convert input indices from float to int32 if necessary (for Vulkan compatibility)
+    
+    def _get_embeddings(self, idx):
+        # Handle float indices for Vulkan compatibility
         if idx.dtype == torch.float:
-            # Move to CPU for conversion, then back to device
-            idx = idx.to('cpu').to(torch.int32).to(idx.device)
-        
-        x = self.drop(self.wte(idx))
+            # Convert to integers on CPU for embedding lookup
+            idx_cpu = idx.cpu().long()
+            embeddings = self.wte(idx_cpu)
+            # Move embeddings back to the original device
+            return embeddings.to(idx.device)
+        else:
+            return self.wte(idx)
+    
+    def forward(self, idx, targets=None, return_indices=False):
+        # Get embeddings with proper handling for Vulkan
+        x = self.drop(self._get_embeddings(idx))
         all_stage_indices, output_from_stage1 = [], None
         total_q_loss, total_e_loss = 0.0, 0.0
         for i, stage in enumerate(self.stages):
@@ -183,10 +191,9 @@ class DiscretizedManifoldTransformer(nn.Module):
         logits = self.lm_head(self.ln_f(output_from_stage1))
         if return_indices: return logits, all_stage_indices
         if targets is not None:
-            # Convert targets from float to int32 if necessary (for Vulkan compatibility)
+            # Handle float targets for Vulkan compatibility
             if targets.dtype == torch.float:
-                # Move to CPU for conversion, then back to device
-                targets = targets.to('cpu').to(torch.int32).to(targets.device)
+                targets = targets.long()
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             total_layers = self.config.n_stages * self.config.n_layer_per_stage
             return logits, (ce_loss, total_q_loss / total_layers, total_e_loss / total_layers)
@@ -196,7 +203,7 @@ class DiscretizedManifoldTransformer(nn.Module):
 def display_bucket_contents(model, tokenizer, device, analysis_tokens, stage_to_show=0, layer_to_show=0, top_k=8):
     model.eval()
     print(f"\n--- BUCKET ANALYSIS (Stage {stage_to_show}, Layer {layer_to_show}) ---")
-    # Convert to float for device compatibility, then convert back for model input
+    # Convert to float for device compatibility
     tokens = analysis_tokens.float().unsqueeze(0).to(device)
     _, all_stage_indices = model(tokens, return_indices=True)
     config = model.config
@@ -229,7 +236,7 @@ def display_bucket_contents(model, tokenizer, device, analysis_tokens, stage_to_
 @torch.no_grad()
 def generate(model, tokenizer, device, prompt, max_new_tokens=50):
     model.eval()
-    # Use float32 for token tensors to support Vulkan, convert to int32 inside model
+    # Use float32 for token tensors to support Vulkan
     prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.float, device=device).unsqueeze(0)
     for _ in range(max_new_tokens):
         idx_cond = prompt_tokens[:, -model.config.block_size:]
@@ -258,7 +265,7 @@ def chat(checkpoint_path, device, max_new_tokens=256):
     while True:
         prompt = input("You: ")
         if prompt.lower() in ['exit', 'quit']: break
-        # Use float32 for token tensors to support Vulkan, convert to int32 inside model
+        # Use float32 for token tensors to support Vulkan
         prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.float, device=device).unsqueeze(0)
         print("Model:", end=" ", flush=True)
         for _ in range(max_new_tokens):
@@ -295,7 +302,7 @@ if __name__ == '__main__':
         
         tokenizer = tiktoken.get_encoding("cl100k_base")
         with open('input.txt', 'r', encoding='utf-8') as f: text = f.read()
-        # Use float32 for token tensors to support Vulkan, convert to int32 inside model
+        # Use float32 for token tensors to support Vulkan
         all_data = torch.tensor(tokenizer.encode(text), dtype=torch.float)
         n = int(0.9 * len(all_data))
         train_data, val_data = all_data[:n], all_data[n:]
@@ -354,7 +361,7 @@ if __name__ == '__main__':
             
             for i in range(len(possible_starts) // BATCH_SIZE):
                 start_indices = possible_starts[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
-                # Use float32 for token tensors to support Vulkan, convert to int32 inside model
+                # Use float32 for token tensors to support Vulkan
                 xb = torch.stack([train_data[j:j+config.block_size] for j in start_indices]).to(device)
                 yb = torch.stack([train_data[j+1:j+config.block_size+1] for j in start_indices]).to(device)
                 logits, (ce_loss, q_loss, e_loss) = model(xb, yb)
