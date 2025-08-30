@@ -300,13 +300,17 @@ if __name__ == '__main__':
             vq_params = [p for name, p in model.named_parameters() if 'vq.quantizers' in name]
             optimizer_vq = torch.optim.AdamW(vq_params, lr=LEARNING_RATE / 10.0, betas=(0.9, 0.95))
             
-            # Load optimizer states
-            optimizer_main.load_state_dict(checkpoint['optimizer_main_state_dict'])
-            optimizer_vq.load_state_dict(checkpoint['optimizer_vq_state_dict'])
+            # Try to load optimizer states if they exist
+            if 'optimizer_main_state_dict' in checkpoint and 'optimizer_vq_state_dict' in checkpoint:
+                optimizer_main.load_state_dict(checkpoint['optimizer_main_state_dict'])
+                optimizer_vq.load_state_dict(checkpoint['optimizer_vq_state_dict'])
+                print("Loaded optimizer states from checkpoint.")
+            else:
+                print("Warning: Optimizer states not found in checkpoint. Using new optimizers.")
             
             # Load training state
-            start_epoch = checkpoint['epoch']
-            global_step = checkpoint['global_step']
+            start_epoch = checkpoint.get('epoch', 0)
+            global_step = checkpoint.get('global_step', 0)
             print(f"Resuming from epoch {start_epoch}, global step {global_step}")
         else:
             config = ModelConfig()
