@@ -219,7 +219,8 @@ def display_bucket_contents(model, tokenizer, device, analysis_tokens, stage_to_
 @torch.no_grad()
 def generate(model, tokenizer, device, prompt, max_new_tokens=50):
     model.eval()
-    prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+    # Use int32 for token tensors to support Vulkan
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32, device=device).unsqueeze(0)
     for _ in range(max_new_tokens):
         idx_cond = prompt_tokens[:, -model.config.block_size:]
         logits, _ = model(idx_cond)
@@ -234,7 +235,9 @@ def chat(checkpoint_path, device, max_new_tokens=256):
     print(f"Loading checkpoint from {checkpoint_path}...")
     # Add ModelConfig to safe globals for loading
     torch.serialization.add_safe_globals([ModelConfig])
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load checkpoint to CPU first to avoid device mismatch issues
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
     config = checkpoint['config']
     tokenizer = tiktoken.get_encoding("cl100k_base")
     config.vocab_size = tokenizer.n_vocab
@@ -245,7 +248,8 @@ def chat(checkpoint_path, device, max_new_tokens=256):
     while True:
         prompt = input("You: ")
         if prompt.lower() in ['exit', 'quit']: break
-        prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+        # Use int32 for token tensors to support Vulkan
+        prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32, device=device).unsqueeze(0)
         print("Model:", end=" ", flush=True)
         for _ in range(max_new_tokens):
             idx_cond = prompt_tokens[:, -model.config.block_size:]
@@ -263,7 +267,11 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None, help='Path to a checkpoint to resume training from.')
     args = parser.parse_args()
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Try to use Vulkan if available, otherwise CPU
+    if torch.backends.vulkan.is_available():
+        device = 'vulkan'
+    else:
+        device = 'cpu'
     print(f"Using device: {device}")
     
     if args.checkpoint:
@@ -277,7 +285,8 @@ if __name__ == '__main__':
         
         tokenizer = tiktoken.get_encoding("cl100k_base")
         with open('input.txt', 'r', encoding='utf-8') as f: text = f.read()
-        all_data = torch.tensor(tokenizer.encode(text))
+        # Use int32 for token tensors to support Vulkan
+        all_data = torch.tensor(tokenizer.encode(text), dtype=torch.int32)
         n = int(0.9 * len(all_data))
         train_data, val_data = all_data[:n], all_data[n:]
         
@@ -289,7 +298,9 @@ if __name__ == '__main__':
             print(f"Resuming training from checkpoint: {args.resume}")
             # Add ModelConfig to safe globals for loading
             torch.serialization.add_safe_globals([ModelConfig])
-            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load checkpoint to CPU first to avoid device mismatch issues
+            checkpoint = torch.load(args.resume, map_location='cpu')
             config = checkpoint['config']
             model = DiscretizedManifoldTransformer(config).to(device)
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -333,6 +344,7 @@ if __name__ == '__main__':
             
             for i in range(len(possible_starts) // BATCH_SIZE):
                 start_indices = possible_starts[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
+                # Use int32 for token tensors to support Vulkan
                 xb = torch.stack([train_data[j:j+config.block_size] for j in start_indices]).to(device)
                 yb = torch.stack([train_data[j+1:j+config.block_size+1] for j in start_indices]).to(device)
                 logits, (ce_loss, q_loss, e_loss) = model(xb, yb)
