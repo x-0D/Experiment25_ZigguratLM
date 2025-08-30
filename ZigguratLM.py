@@ -215,6 +215,7 @@ def display_bucket_contents(model, tokenizer, device, analysis_tokens, stage_to_
             for bucket_id, counter in used_buckets[:5]: print(f"  Bucket [{bucket_id:4d}] (Unique: {len(counter):,d}): {counter.most_common(top_k)}")
     print("--- End of Bucket Analysis ---\n")
     model.train()
+
 @torch.no_grad()
 def generate(model, tokenizer, device, prompt, max_new_tokens=50):
     model.eval()
@@ -228,6 +229,7 @@ def generate(model, tokenizer, device, prompt, max_new_tokens=50):
     decoded = tokenizer.decode(prompt_tokens.squeeze().tolist())
     print(f"--- PROMPT: '{prompt}' ---\nGENERATION: {decoded}\n-------------------------------------")
     model.train()
+
 def chat(checkpoint_path, device, max_new_tokens=256):
     print(f"Loading checkpoint from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -256,11 +258,12 @@ def chat(checkpoint_path, device, max_new_tokens=256):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train or chat with a Multi-Stage Hierarchical DMT.")
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to a checkpoint for chat mode.')
+    parser.add_argument('--resume', type=str, default=None, help='Path to a checkpoint to resume training from.')
     args = parser.parse_args()
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-
+    
     if args.checkpoint:
         chat(args.checkpoint, device)
     else:
@@ -276,21 +279,46 @@ if __name__ == '__main__':
         n = int(0.9 * len(all_data))
         train_data, val_data = all_data[:n], all_data[n:]
         
-        config = ModelConfig()
-        config.vocab_size = tokenizer.n_vocab
-        model = DiscretizedManifoldTransformer(config).to(device)
+        # Initialize variables for resuming
+        start_epoch = 0
+        global_step = 0
         
-        # Using Differential Learning Rates
-        main_params = [p for name, p in model.named_parameters() if 'vq.quantizers' not in name]
-        optimizer_main = torch.optim.AdamW(main_params, lr=LEARNING_RATE, betas=(0.9, 0.95))
-        vq_params = [p for name, p in model.named_parameters() if 'vq.quantizers' in name]
-        optimizer_vq = torch.optim.AdamW(vq_params, lr=LEARNING_RATE / 10.0, betas=(0.9, 0.95))
-
+        if args.resume:
+            print(f"Resuming training from checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            config = checkpoint['config']
+            model = DiscretizedManifoldTransformer(config).to(device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Create optimizers
+            main_params = [p for name, p in model.named_parameters() if 'vq.quantizers' not in name]
+            optimizer_main = torch.optim.AdamW(main_params, lr=LEARNING_RATE, betas=(0.9, 0.95))
+            vq_params = [p for name, p in model.named_parameters() if 'vq.quantizers' in name]
+            optimizer_vq = torch.optim.AdamW(vq_params, lr=LEARNING_RATE / 10.0, betas=(0.9, 0.95))
+            
+            # Load optimizer states
+            optimizer_main.load_state_dict(checkpoint['optimizer_main_state_dict'])
+            optimizer_vq.load_state_dict(checkpoint['optimizer_vq_state_dict'])
+            
+            # Load training state
+            start_epoch = checkpoint['epoch']
+            global_step = checkpoint['global_step']
+            print(f"Resuming from epoch {start_epoch}, global step {global_step}")
+        else:
+            config = ModelConfig()
+            config.vocab_size = tokenizer.n_vocab
+            model = DiscretizedManifoldTransformer(config).to(device)
+            
+            # Create optimizers
+            main_params = [p for name, p in model.named_parameters() if 'vq.quantizers' not in name]
+            optimizer_main = torch.optim.AdamW(main_params, lr=LEARNING_RATE, betas=(0.9, 0.95))
+            vq_params = [p for name, p in model.named_parameters() if 'vq.quantizers' in name]
+            optimizer_vq = torch.optim.AdamW(vq_params, lr=LEARNING_RATE / 10.0, betas=(0.9, 0.95))
+        
         print(f"Model initialized with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters.")
         print(f"Training with two optimizers: Main (LR: {LEARNING_RATE}) and VQ (LR: {LEARNING_RATE / 10.0}).")
         
-        global_step = 0
-        for epoch in range(NUM_EPOCHS):
+        for epoch in range(start_epoch, NUM_EPOCHS):
             print(f"\n--- Starting Epoch {epoch+1}/{NUM_EPOCHS} ---")
             possible_starts = list(range(len(train_data) - config.block_size - 1))
             random.shuffle(possible_starts)
@@ -299,18 +327,14 @@ if __name__ == '__main__':
                 start_indices = possible_starts[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
                 xb = torch.stack([train_data[j:j+config.block_size] for j in start_indices]).to(device)
                 yb = torch.stack([train_data[j+1:j+config.block_size+1] for j in start_indices]).to(device)
-
                 logits, (ce_loss, q_loss, e_loss) = model(xb, yb)
                 
                 main_loss = ce_loss
                 vq_optimizer_loss = q_loss
-
                 optimizer_main.zero_grad(set_to_none=True)
                 optimizer_vq.zero_grad(set_to_none=True)
-
                 main_loss.backward(retain_graph=True)
                 vq_optimizer_loss.backward()
-
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
                 optimizer_main.step()
@@ -321,7 +345,7 @@ if __name__ == '__main__':
                     print(f"Epoch {epoch+1}, Step {global_step}: Loss {total_loss.item():.4f} (CE: {ce_loss.item():.4f}, Q_loss: {q_loss.item():.4f}, E_loss: {e_loss.item():.4f})")
                 
                 if global_step > 0 and global_step % EVAL_EVERY == 0:
-                    generate(model, tokenizer, device, prompt="The meaning of life is")
+                    generate(model, tokenizer, device, prompt="Чайник это ")
                     analysis_sample = val_data[:config.block_size]
                     display_bucket_contents(model, tokenizer, device, analysis_sample, stage_to_show=0, layer_to_show=0)
                     if config.n_stages > 1:
@@ -331,6 +355,12 @@ if __name__ == '__main__':
                 
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f"dmt_checkpoint_epoch_{epoch+1}.pth")
             print(f"Saving checkpoint to {checkpoint_path}")
-            torch.save({'epoch': epoch+1, 'model_state_dict': model.state_dict(), 'config': config}, checkpoint_path)
-
+            torch.save({
+                'epoch': epoch+1,
+                'global_step': global_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_main_state_dict': optimizer_main.state_dict(),
+                'optimizer_vq_state_dict': optimizer_vq.state_dict(),
+                'config': config
+            }, checkpoint_path)
         print("\n--- Training Finished ---")
