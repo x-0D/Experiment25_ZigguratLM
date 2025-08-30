@@ -137,18 +137,48 @@ class ResidualTokenFusionBlock(nn.Module):
         output = self.activation(x_fused + x_skip)
         return self.final_ln(output)
 
+class VulkanCompatibleEmbedding(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
+        nn.init.normal_(self.weight, mean=0, std=embedding_dim ** -0.5)
+    
+    def forward(self, indices):
+        # For Vulkan, we'll implement embedding lookup using matrix multiplication
+        # Convert indices to one-hot encoding, then multiply by weight matrix
+        batch_size, seq_len = indices.shape
+        
+        # Create one-hot encoding on CPU (since Vulkan doesn't support one-hot)
+        indices_cpu = indices.detach().cpu().long()
+        one_hot = torch.zeros(batch_size * seq_len, self.num_embeddings, device='cpu')
+        one_hot.scatter_(1, indices_cpu.view(-1, 1), 1)
+        
+        # Move one-hot to the same device as weight
+        one_hot = one_hot.to(self.weight.device)
+        
+        # Multiply by weight matrix to get embeddings
+        embeddings = torch.matmul(one_hot, self.weight)
+        embeddings = embeddings.view(batch_size, seq_len, self.embedding_dim)
+        
+        return embeddings
+
 class DiscretizedManifoldTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.wte, self.drop = nn.Embedding(config.vocab_size, config.n_embd), nn.Dropout(config.dropout)
+        # Use our custom Vulkan-compatible embedding
+        self.wte = VulkanCompatibleEmbedding(config.vocab_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
         self.stages, self.fusion_blocks = nn.ModuleList(), nn.ModuleList()
         for i in range(config.n_stages):
             self.stages.append(nn.ModuleList([DiscretizedManifoldBlock(config) for _ in range(config.n_layer_per_stage)]))
             if i < config.n_stages - 1: self.fusion_blocks.append(ResidualTokenFusionBlock(config))
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.wte.weight = self.lm_head.weight
+        # Tie weights with our custom embedding
+        self.lm_head.weight = self.wte.weight
         self.apply(self._init_weights)
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -157,21 +187,10 @@ class DiscretizedManifoldTransformer(nn.Module):
         total_layers = self.config.n_stages * self.config.n_layer_per_stage
         if isinstance(module, SimplifiedRetention): torch.nn.init.normal_(module.out_proj.weight, mean=0.0, std=0.02/math.sqrt(2*total_layers))
         if hasattr(module, 'mlp') and isinstance(module.mlp[-2], nn.Linear): torch.nn.init.normal_(module.mlp[-2].weight, mean=0.0, std=0.02/math.sqrt(2*total_layers))
-    
-    def _get_embeddings(self, idx):
-        # Handle float indices for Vulkan compatibility
-        if idx.dtype == torch.float:
-            # Convert to integers on CPU for embedding lookup
-            idx_cpu = idx.cpu().long()
-            embeddings = self.wte(idx_cpu)
-            # Move embeddings back to the original device
-            return embeddings.to(idx.device)
-        else:
-            return self.wte(idx)
-    
     def forward(self, idx, targets=None, return_indices=False):
-        # Get embeddings with proper handling for Vulkan
-        x = self.drop(self._get_embeddings(idx))
+        # idx is already a float tensor for Vulkan compatibility
+        # Our custom embedding layer will handle the conversion internally
+        x = self.drop(self.wte(idx))
         all_stage_indices, output_from_stage1 = [], None
         total_q_loss, total_e_loss = 0.0, 0.0
         for i, stage in enumerate(self.stages):
@@ -191,9 +210,6 @@ class DiscretizedManifoldTransformer(nn.Module):
         logits = self.lm_head(self.ln_f(output_from_stage1))
         if return_indices: return logits, all_stage_indices
         if targets is not None:
-            # Handle float targets for Vulkan compatibility
-            if targets.dtype == torch.float:
-                targets = targets.long()
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             total_layers = self.config.n_stages * self.config.n_layer_per_stage
             return logits, (ce_loss, total_q_loss / total_layers, total_e_loss / total_layers)
