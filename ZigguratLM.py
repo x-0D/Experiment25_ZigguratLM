@@ -268,7 +268,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     # Try to use Vulkan if available, otherwise CPU
-    if torch.backends.vulkan.is_available():
+    if torch.is_vulkan_available():
         device = 'vulkan'
     else:
         device = 'cpu'
@@ -384,3 +384,4 @@ if __name__ == '__main__':
                 'config': config
             }, checkpoint_path)
         print("\n--- Training Finished ---")
+
