@@ -158,6 +158,10 @@ class DiscretizedManifoldTransformer(nn.Module):
         if isinstance(module, SimplifiedRetention): torch.nn.init.normal_(module.out_proj.weight, mean=0.0, std=0.02/math.sqrt(2*total_layers))
         if hasattr(module, 'mlp') and isinstance(module.mlp[-2], nn.Linear): torch.nn.init.normal_(module.mlp[-2].weight, mean=0.0, std=0.02/math.sqrt(2*total_layers))
     def forward(self, idx, targets=None, return_indices=False):
+        # Convert input indices from float to long if necessary (for Vulkan compatibility)
+        if idx.dtype == torch.float:
+            idx = idx.long()
+        
         x = self.drop(self.wte(idx))
         all_stage_indices, output_from_stage1 = [], None
         total_q_loss, total_e_loss = 0.0, 0.0
@@ -178,6 +182,9 @@ class DiscretizedManifoldTransformer(nn.Module):
         logits = self.lm_head(self.ln_f(output_from_stage1))
         if return_indices: return logits, all_stage_indices
         if targets is not None:
+            # Convert targets from float to long if necessary (for Vulkan compatibility)
+            if targets.dtype == torch.float:
+                targets = targets.long()
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             total_layers = self.config.n_stages * self.config.n_layer_per_stage
             return logits, (ce_loss, total_q_loss / total_layers, total_e_loss / total_layers)
@@ -207,7 +214,7 @@ def display_bucket_contents(model, tokenizer, device, analysis_tokens, stage_to_
             for seq_idx in range(expected_seq_len):
                 token_id = tokens[0, seq_idx].item()
                 bucket_id = layer_indices[level_idx, 0, seq_idx].item()
-                try: bucket_contents[level_idx][bucket_id][tokenizer.decode([token_id])] += 1
+                try: bucket_contents[level_idx][bucket_id][tokenizer.decode([int(token_id)])] += 1
                 except: continue
         for level_idx in range(config.vq_levels):
             print(f"\n--- VQ HIERARCHY LEVEL {level_idx} ---")
@@ -219,15 +226,15 @@ def display_bucket_contents(model, tokenizer, device, analysis_tokens, stage_to_
 @torch.no_grad()
 def generate(model, tokenizer, device, prompt, max_new_tokens=50):
     model.eval()
-    # Use int32 for token tensors to support Vulkan
-    prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32, device=device).unsqueeze(0)
+    # Use float32 for token tensors to support Vulkan, convert to long inside model
+    prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.float, device=device).unsqueeze(0)
     for _ in range(max_new_tokens):
         idx_cond = prompt_tokens[:, -model.config.block_size:]
         logits, _ = model(idx_cond)
         logits, probs = logits[:, -1, :], F.softmax(logits[:, -1, :], dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
-        prompt_tokens = torch.cat((prompt_tokens, next_token), dim=1)
-    decoded = tokenizer.decode(prompt_tokens.squeeze().tolist())
+        prompt_tokens = torch.cat((prompt_tokens, next_token.float()), dim=1)
+    decoded = tokenizer.decode([int(t) for t in prompt_tokens.squeeze().tolist()])
     print(f"--- PROMPT: '{prompt}' ---\nGENERATION: {decoded}\n-------------------------------------")
     model.train()
 
@@ -248,8 +255,8 @@ def chat(checkpoint_path, device, max_new_tokens=256):
     while True:
         prompt = input("You: ")
         if prompt.lower() in ['exit', 'quit']: break
-        # Use int32 for token tensors to support Vulkan
-        prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.int32, device=device).unsqueeze(0)
+        # Use float32 for token tensors to support Vulkan, convert to long inside model
+        prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.float, device=device).unsqueeze(0)
         print("Model:", end=" ", flush=True)
         for _ in range(max_new_tokens):
             idx_cond = prompt_tokens[:, -model.config.block_size:]
@@ -257,8 +264,8 @@ def chat(checkpoint_path, device, max_new_tokens=256):
             logits, probs = logits[:, -1, :], F.softmax(logits[:, -1, :], dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             if hasattr(tokenizer, 'eot_token') and next_token.item() == tokenizer.eot_token: break
-            prompt_tokens = torch.cat((prompt_tokens, next_token), dim=1)
-            print(tokenizer.decode([next_token.item()]), end="", flush=True)
+            prompt_tokens = torch.cat((prompt_tokens, next_token.float()), dim=1)
+            print(tokenizer.decode([int(next_token.item())]), end="", flush=True)
         print("\n")
 
 if __name__ == '__main__':
@@ -285,8 +292,8 @@ if __name__ == '__main__':
         
         tokenizer = tiktoken.get_encoding("cl100k_base")
         with open('input.txt', 'r', encoding='utf-8') as f: text = f.read()
-        # Use int32 for token tensors to support Vulkan
-        all_data = torch.tensor(tokenizer.encode(text), dtype=torch.int32)
+        # Use float32 for token tensors to support Vulkan, convert to long inside model
+        all_data = torch.tensor(tokenizer.encode(text), dtype=torch.float)
         n = int(0.9 * len(all_data))
         train_data, val_data = all_data[:n], all_data[n:]
         
@@ -344,7 +351,7 @@ if __name__ == '__main__':
             
             for i in range(len(possible_starts) // BATCH_SIZE):
                 start_indices = possible_starts[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
-                # Use int32 for token tensors to support Vulkan
+                # Use float32 for token tensors to support Vulkan, convert to long inside model
                 xb = torch.stack([train_data[j:j+config.block_size] for j in start_indices]).to(device)
                 yb = torch.stack([train_data[j+1:j+config.block_size+1] for j in start_indices]).to(device)
                 logits, (ce_loss, q_loss, e_loss) = model(xb, yb)
@@ -384,4 +391,3 @@ if __name__ == '__main__':
                 'config': config
             }, checkpoint_path)
         print("\n--- Training Finished ---")
-
