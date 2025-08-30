@@ -232,7 +232,9 @@ def generate(model, tokenizer, device, prompt, max_new_tokens=50):
 
 def chat(checkpoint_path, device, max_new_tokens=256):
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Add ModelConfig to safe globals for loading
+    torch.serialization.add_safe_globals([ModelConfig])
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint['config']
     tokenizer = tiktoken.get_encoding("cl100k_base")
     config.vocab_size = tokenizer.n_vocab
@@ -285,6 +287,8 @@ if __name__ == '__main__':
         
         if args.resume:
             print(f"Resuming training from checkpoint: {args.resume}")
+            # Add ModelConfig to safe globals for loading
+            torch.serialization.add_safe_globals([ModelConfig])
             checkpoint = torch.load(args.resume, map_location=device)
             config = checkpoint['config']
             model = DiscretizedManifoldTransformer(config).to(device)
