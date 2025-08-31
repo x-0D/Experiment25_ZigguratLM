@@ -54,7 +54,7 @@ class SimplifiedRetention(nn.Module):
         self.v_proj, self.g_proj = nn.Linear(config.n_embd, config.n_embd, bias=False), nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.rope = RotaryEmbedding(dim=self.head_dim)
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout  # Store dropout rate but don't create dropout layer
         decay = 1.0 - torch.exp2(-5.0 - torch.arange(0, config.n_head, dtype=torch.float32))
         self.decay = nn.Parameter(decay, requires_grad=False)
     def forward(self, x):
@@ -69,7 +69,14 @@ class SimplifiedRetention(nn.Module):
         retention = (q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)) * decay_matrix
         output = (retention @ v).transpose(1, 2).contiguous().view(B, S, D)
         g = F.silu(self.g_proj(x))
-        return self.dropout(self.out_proj(output * g))
+        
+        # Apply custom dropout that works with Vulkan
+        if self.training and self.dropout > 0:
+            # Create a mask on CPU and move to device
+            mask = torch.rand_like(output) > self.dropout
+            output = output * mask.float() / (1.0 - self.dropout)
+        
+        return self.out_proj(output * g)
 
 class VectorQuantizer(nn.Module):
     def __init__(self, num_codes: int, embedding_dim: int, commitment_cost: float):
@@ -108,12 +115,25 @@ class DiscretizedManifoldBlock(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.ln_1, self.retention, self.ln_2 = nn.LayerNorm(config.n_embd), SimplifiedRetention(config), nn.LayerNorm(config.n_embd)
-        self.mlp = nn.Sequential(nn.Linear(config.n_embd, 4*config.n_embd), nn.GELU(), nn.Linear(4*config.n_embd, config.n_embd), nn.Dropout(config.dropout))
+        self.mlp = nn.Sequential(
+            nn.Linear(config.n_embd, 4*config.n_embd), 
+            nn.GELU(), 
+            nn.Linear(4*config.n_embd, config.n_embd)
+        )
+        self.dropout_rate = config.dropout  # Store dropout rate but don't create dropout layer
         self.vq = ResidualVectorQuantizer(config.vq_levels, config.num_codes, config.n_embd, config.commitment_cost)
         self.ln_3 = nn.LayerNorm(config.n_embd)
     def forward(self, x, return_indices=False):
         x = x + self.retention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        mlp_output = self.mlp(self.ln_2(x))
+        
+        # Apply custom dropout that works with Vulkan
+        if self.training and self.dropout_rate > 0:
+            # Create a mask on CPU and move to device
+            mask = torch.rand_like(mlp_output) > self.dropout_rate
+            mlp_output = mlp_output * mask.float() / (1.0 - self.dropout_rate)
+        
+        x = x + mlp_output
         x_norm = self.ln_3(x)
         quantized_x, q_loss, e_loss, indices = self.vq(x_norm)
         output = x + quantized_x
@@ -145,23 +165,40 @@ class VulkanCompatibleEmbedding(nn.Module):
         # Store embedding weights as a regular parameter
         self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
         nn.init.normal_(self.weight, mean=0, std=embedding_dim ** -0.5)
+        
+        # Create a linear layer for each possible token value
+        # This is inefficient in terms of memory but works around Vulkan limitations
+        self.embed_layers = nn.ModuleList([
+            nn.Linear(1, embedding_dim, bias=False) for _ in range(num_embeddings)
+        ])
+        
+        # Initialize the weights of each linear layer to match the corresponding embedding
+        for i, layer in enumerate(self.embed_layers):
+            layer.weight.data = self.weight[i:i+1].clone()
     
     def forward(self, indices):
-        # For Vulkan, we'll implement embedding lookup using a different approach
-        # We'll use gather operations which might be better supported
-        
         batch_size, seq_len = indices.shape
         device = indices.device
         
-        # Convert float indices to long on CPU (since Vulkan doesn't support long)
-        indices_cpu = indices.detach().cpu().long()
+        # Initialize output tensor
+        embeddings = torch.zeros(batch_size, seq_len, self.embedding_dim, device=device)
         
-        # Get embeddings on CPU
-        embeddings = torch.index_select(self.weight.cpu(), 0, indices_cpu.view(-1))
-        embeddings = embeddings.view(batch_size, seq_len, self.embedding_dim)
+        # For each position in the sequence, get the corresponding embedding
+        for i in range(batch_size):
+            for j in range(seq_len):
+                token_idx = int(indices[i, j].item())
+                # Create a dummy input for the linear layer
+                dummy_input = torch.ones(1, 1, device=device)
+                # Get the embedding using the corresponding linear layer
+                embedding = self.embed_layers[token_idx](dummy_input)
+                embeddings[i, j] = embedding.squeeze(0)
         
-        # Move embeddings to the target device
-        return embeddings.to(device)
+        return embeddings
+    
+    def sync_weights(self):
+        # Sync the weights from the main weight parameter to the linear layers
+        for i, layer in enumerate(self.embed_layers):
+            layer.weight.data = self.weight[i:i+1].clone()
 
 class DiscretizedManifoldTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -169,7 +206,7 @@ class DiscretizedManifoldTransformer(nn.Module):
         self.config = config
         # Use our custom Vulkan-compatible embedding
         self.wte = VulkanCompatibleEmbedding(config.vocab_size, config.n_embd)
-        self.drop = nn.Dropout(config.dropout)
+        self.dropout_rate = config.dropout  # Store dropout rate but don't create dropout layer
         self.stages, self.fusion_blocks = nn.ModuleList(), nn.ModuleList()
         for i in range(config.n_stages):
             self.stages.append(nn.ModuleList([DiscretizedManifoldBlock(config) for _ in range(config.n_layer_per_stage)]))
@@ -189,7 +226,18 @@ class DiscretizedManifoldTransformer(nn.Module):
     def forward(self, idx, targets=None, return_indices=False):
         # idx is already a float tensor for Vulkan compatibility
         # Our custom embedding layer will handle the conversion internally
-        x = self.drop(self.wte(idx))
+        
+        # Sync embedding weights before forward pass
+        self.wte.sync_weights()
+        
+        x = self.wte(idx)
+        
+        # Apply custom dropout that works with Vulkan
+        if self.training and self.dropout_rate > 0:
+            # Create a mask on CPU and move to device
+            mask = torch.rand_like(x) > self.dropout_rate
+            x = x * mask.float() / (1.0 - self.dropout_rate)
+        
         all_stage_indices, output_from_stage1 = [], None
         total_q_loss, total_e_loss = 0.0, 0.0
         for i, stage in enumerate(self.stages):
@@ -285,7 +333,10 @@ def chat(checkpoint_path, device, max_new_tokens=256):
         print("Model:", end=" ", flush=True)
         for _ in range(max_new_tokens):
             idx_cond = prompt_tokens[:, -model.config.block_size:]
-            with torch.no_grad(): logits, _ = model(idx_cond)
+            with torch.no_grad(): 
+                # Sync embedding weights before forward pass
+                model.wte.sync_weights()
+                logits, _ = model(idx_cond)
             logits, probs = logits[:, -1, :], F.softmax(logits[:, -1, :], dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             if hasattr(tokenizer, 'eot_token') and next_token.item() == tokenizer.eot_token: break
