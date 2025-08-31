@@ -145,40 +145,23 @@ class VulkanCompatibleEmbedding(nn.Module):
         # Store embedding weights as a regular parameter
         self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
         nn.init.normal_(self.weight, mean=0, std=embedding_dim ** -0.5)
-        
-        # Create a linear layer for each possible token value
-        # This is inefficient in terms of memory but works around Vulkan limitations
-        self.embed_layers = nn.ModuleList([
-            nn.Linear(1, embedding_dim, bias=False) for _ in range(num_embeddings)
-        ])
-        
-        # Initialize the weights of each linear layer to match the corresponding embedding
-        for i, layer in enumerate(self.embed_layers):
-            layer.weight.data = self.weight[i:i+1].clone()
     
     def forward(self, indices):
+        # For Vulkan, we'll implement embedding lookup using a different approach
+        # We'll use gather operations which might be better supported
+        
         batch_size, seq_len = indices.shape
         device = indices.device
         
-        # Initialize output tensor
-        embeddings = torch.zeros(batch_size, seq_len, self.embedding_dim, device=device)
+        # Convert float indices to long on CPU (since Vulkan doesn't support long)
+        indices_cpu = indices.detach().cpu().long()
         
-        # For each position in the sequence, get the corresponding embedding
-        for i in range(batch_size):
-            for j in range(seq_len):
-                token_idx = int(indices[i, j].item())
-                # Create a dummy input for the linear layer
-                dummy_input = torch.ones(1, 1, device=device)
-                # Get the embedding using the corresponding linear layer
-                embedding = self.embed_layers[token_idx](dummy_input)
-                embeddings[i, j] = embedding.squeeze(0)
+        # Get embeddings on CPU
+        embeddings = torch.index_select(self.weight.cpu(), 0, indices_cpu.view(-1))
+        embeddings = embeddings.view(batch_size, seq_len, self.embedding_dim)
         
-        return embeddings
-    
-    def sync_weights(self):
-        # Sync the weights from the main weight parameter to the linear layers
-        for i, layer in enumerate(self.embed_layers):
-            layer.weight.data = self.weight[i:i+1].clone()
+        # Move embeddings to the target device
+        return embeddings.to(device)
 
 class DiscretizedManifoldTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -206,10 +189,6 @@ class DiscretizedManifoldTransformer(nn.Module):
     def forward(self, idx, targets=None, return_indices=False):
         # idx is already a float tensor for Vulkan compatibility
         # Our custom embedding layer will handle the conversion internally
-        
-        # Sync embedding weights before forward pass
-        self.wte.sync_weights()
-        
         x = self.drop(self.wte(idx))
         all_stage_indices, output_from_stage1 = [], None
         total_q_loss, total_e_loss = 0.0, 0.0
@@ -306,10 +285,7 @@ def chat(checkpoint_path, device, max_new_tokens=256):
         print("Model:", end=" ", flush=True)
         for _ in range(max_new_tokens):
             idx_cond = prompt_tokens[:, -model.config.block_size:]
-            with torch.no_grad(): 
-                # Sync embedding weights before forward pass
-                model.wte.sync_weights()
-                logits, _ = model(idx_cond)
+            with torch.no_grad(): logits, _ = model(idx_cond)
             logits, probs = logits[:, -1, :], F.softmax(logits[:, -1, :], dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             if hasattr(tokenizer, 'eot_token') and next_token.item() == tokenizer.eot_token: break
