@@ -165,6 +165,16 @@ class VulkanCompatibleEmbedding(nn.Module):
         # Store embedding weights as a regular parameter
         self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
         nn.init.normal_(self.weight, mean=0, std=embedding_dim ** -0.5)
+        
+        # Create a linear layer for each token to avoid indexing issues
+        # We'll use these as "lookup" layers
+        self.lookup_layers = nn.ModuleList([
+            nn.Linear(1, embedding_dim, bias=False) for _ in range(num_embeddings)
+        ])
+        
+        # Initialize weights
+        for i, layer in enumerate(self.lookup_layers):
+            layer.weight.data = self.weight[i:i+1].t().clone()
     
     def forward(self, indices):
         batch_size, seq_len = indices.shape
@@ -176,15 +186,22 @@ class VulkanCompatibleEmbedding(nn.Module):
         # Initialize output tensor
         embeddings = torch.zeros(batch_size, seq_len, self.embedding_dim, device=device)
         
-        # Process in batches to avoid memory issues
-        batch_size_actual = batch_size
-        for b in range(batch_size_actual):
+        # For each token in the sequence, use the corresponding lookup layer
+        for b in range(batch_size):
             for s in range(seq_len):
                 token_idx = indices_cpu[b, s].item()
-                # Directly copy the embedding weight
-                embeddings[b, s] = self.weight[token_idx]
+                # Create a dummy input tensor
+                dummy_input = torch.ones(1, 1, device=device)
+                # Use the corresponding lookup layer
+                embedding = self.lookup_layers[token_idx](dummy_input)
+                embeddings[b, s] = embedding.squeeze(0)
         
         return embeddings
+    
+    def sync_weights(self):
+        # Sync the weights from the main weight parameter to the lookup layers
+        for i, layer in enumerate(self.lookup_layers):
+            layer.weight.data = self.weight[i:i+1].t().clone()
 
 class DiscretizedManifoldTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -212,6 +229,9 @@ class DiscretizedManifoldTransformer(nn.Module):
     def forward(self, idx, targets=None, return_indices=False):
         # idx is already a float tensor for Vulkan compatibility
         # Our custom embedding layer will handle the conversion internally
+        
+        # Sync embedding weights before forward pass
+        self.wte.sync_weights()
         
         x = self.wte(idx)
         
@@ -286,6 +306,8 @@ def generate(model, tokenizer, device, prompt, max_new_tokens=50):
     prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.float, device=device).unsqueeze(0)
     for _ in range(max_new_tokens):
         idx_cond = prompt_tokens[:, -model.config.block_size:]
+        # Sync embedding weights before forward pass
+        model.wte.sync_weights()
         logits, _ = model(idx_cond)
         logits, probs = logits[:, -1, :], F.softmax(logits[:, -1, :], dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
@@ -317,6 +339,8 @@ def chat(checkpoint_path, device, max_new_tokens=256):
         for _ in range(max_new_tokens):
             idx_cond = prompt_tokens[:, -model.config.block_size:]
             with torch.no_grad(): 
+                # Sync embedding weights before forward pass
+                model.wte.sync_weights()
                 logits, _ = model(idx_cond)
             logits, probs = logits[:, -1, :], F.softmax(logits[:, -1, :], dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
